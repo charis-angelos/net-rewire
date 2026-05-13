@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <arpa/inet.h>
+#include <string.h>
 
 struct pkt_info {
     int is_ipv4;

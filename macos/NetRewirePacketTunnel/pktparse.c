@@ -7,52 +7,55 @@
 
 #include "pktparse.h"
 #include <string.h>
-#include <netinet/ip.h>
-#include <netinet/tcp.h>
+#include <arpa/inet.h>
 
 int pkt_parse(const uint8_t *buf, size_t len, struct pkt_info *info) {
     memset(info, 0, sizeof(*info));
 
-    // Check minimum length for IP header
-    if (len < sizeof(struct ip)) {
+    // Check minimum length for IPv4 header (20 bytes)
+    if (len < 20) {
         return 0;
     }
 
-    struct ip *iph = (struct ip *)buf;
+    // Parse IP header manually (no dependency on netinet/ip.h)
+    uint8_t version = (buf[0] >> 4) & 0x0F;
+    if (version != 4) {
+        return 0;  // Not IPv4
+    }
 
-    // Check IP version
-    if ((iph->ip_v) != 4) {
+    uint8_t ihl = (buf[0] & 0x0F) * 4;
+    if (ihl < 20 || len < ihl) {
         return 0;
     }
 
-    // Calculate IP header length
-    int ihl = iph->ip_hl * 4;
-    if (len < ihl) {
-        return 0;
-    }
-
-    // Fill IP information
     info->is_ipv4 = 1;
     info->ip_header_len = ihl;
-    info->ip_src = iph->ip_src.s_addr;
-    info->ip_dst = iph->ip_dst.s_addr;
 
-    // Check if TCP
-    if (iph->ip_p != IPPROTO_TCP) {
-        return 1; // Valid IP packet but not TCP
+    // Source IP (bytes 12-15) and Dest IP (bytes 16-19), network byte order
+    memcpy(&info->ip_src, &buf[12], 4);
+    memcpy(&info->ip_dst, &buf[16], 4);
+
+    uint8_t protocol = buf[9];
+    if (protocol != 6) {  // 6 = TCP
+        return 1;  // Valid IP packet but not TCP
     }
 
-    // For TCP, check if we have enough data for TCP header
-    if (len < ihl + sizeof(struct tcphdr)) {
-        return 1; // Valid IP packet but TCP header incomplete
+    // TCP header starts at offset ihl, minimum 20 bytes
+    if (len < (size_t)ihl + 20) {
+        return 1;  // Valid IP packet but TCP header incomplete
     }
 
-    // Parse TCP header
-    struct tcphdr *tcph = (struct tcphdr *)(buf + ihl);
+    uint8_t tcp_header_len = (buf[ihl + 12] >> 4) * 4;
+
     info->is_tcp = 1;
-    info->tcp_header_len = tcph->th_off * 4;
-    info->tcp_src = tcph->th_sport;
-    info->tcp_dst = tcph->th_dport;
+    info->tcp_header_len = tcp_header_len;
+
+    // Source port and dest port in NETWORK byte order (like struct tcphdr fields)
+    uint16_t src_port, dst_port;
+    memcpy(&src_port, &buf[ihl], 2);
+    memcpy(&dst_port, &buf[ihl + 2], 2);
+    info->tcp_src = src_port;
+    info->tcp_dst = dst_port;
 
     return 1;
 }
