@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <pthread.h>
+#include <sys/select.h>
 
 #define SERVER_PORT 12345
 #define TUN_DEVICE "tun0"
