@@ -2,6 +2,54 @@
 
 A macOS Network Extension (`NEPacketTunnelProvider`) that captures outbound TCP port 25 traffic and forwards it through a VPN tunnel to an Ubuntu server for transparent SMTP relay.
 
+## Current Status
+
+- The project has been converted from app-extension to **system-extension** (product type, Info.plist, MACH_O_TYPE, etc. all updated)
+- Source compiles and links successfully, producing a 48KB Mach-O bundle
+- Development team: **3Y9P65S34Z** (Andrew Saintway Personal Team)
+- Entitlements embedded into binary via `ld -sectcreate __TEXT __entitlements`
+
+### Core Bottleneck
+
+Apple **free developer accounts do not support the Network Extensions capability**. Xcode explicitly errors:
+
+> Personal development teams do not support the Network Extensions capability.
+
+Without a valid provisioning profile, macOS will not load the Network Extension.
+
+### Test Plan: SIP Disabled + Developer Mode
+
+System Extension developer mode (`systemextensionsctl developer on`) allows loading unnotarized extensions, but requires SIP to be disabled first.
+
+**Steps on andrewmac-mini:**
+
+1. **Disable SIP** (requires Recovery Mode):
+   - Reboot holding power button → "Options" → Recovery Mode
+   - Terminal: `csrutil disable`
+   - Reboot back to normal system
+2. **Enable System Extension developer mode**:
+   ```bash
+   systemextensionsctl developer on
+   ```
+3. **Deploy the built extension**:
+   - Copy `NetRewirePacketTunnel.systemextension` bundle to andrewmac-mini
+   - Deploy App and Extension together
+   - Manually allow the extension in System Settings → General → Login Items & Extensions
+4. **Verify**:
+   ```bash
+   systemextensionsctl list
+   # Confirm extension is loaded
+   nc -v smtp.example.com 25
+   # Confirm SMTP connection is tunneled
+   ```
+
+### Known Risks
+
+- `__TEXT,__entitlements` section is a legacy approach (pre-macOS 10.12); modern macOS reads entitlements from the CMS signature blob. SIP disabled may cause the system to fall back to checking this section, but this is undocumented
+- Disabling SIP reduces system security
+- Even if the extension loads successfully, `neagent` may still check for a provisioning profile
+- This approach is for local macOS testing only; not suitable for distribution
+
 ## Architecture
 
 - **macOS Client**: Network Extension that intercepts TCP port 25 traffic and encapsulates it for tunneling
