@@ -2,122 +2,135 @@
 //  AppDelegate.m
 //  NetRewireApp
 //
-//  Created by Claude Code
+//  Manages net-rewire-daemon via launchd (no Network Extension dependency).
 //
 
 #import "AppDelegate.h"
-#import <NetworkExtension/NetworkExtension.h>
+#import <ServiceManagement/ServiceManagement.h>
+
+static NSString * const kDaemonLabel = @"com.netrewire.daemon";
 
 @interface AppDelegate ()
-@property (strong) NETunnelProviderManager *manager;
+@property (strong) NSTextField *statusLabel;
+@property (strong) NSTimer     *statusTimer;
 @end
 
 @implementation AppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
-    // Create the main window
-    self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 400, 300)
-                                              styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable
-                                                backing:NSBackingStoreBuffered
-                                                  defer:NO];
+    self.window = [[NSWindow alloc]
+        initWithContentRect:NSMakeRect(0, 0, 400, 300)
+                  styleMask:NSWindowStyleMaskTitled
+                    | NSWindowStyleMaskClosable
+                    | NSWindowStyleMaskMiniaturizable
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
     [self.window setTitle:@"Net-Rewire"];
     [self.window center];
     [self.window makeKeyAndOrderFront:nil];
 
-    // Create UI elements
-    NSButton *startButton = [[NSButton alloc] initWithFrame:NSMakeRect(150, 150, 100, 30)];
-    [startButton setTitle:@"Start VPN"];
-    [startButton setButtonType:NSButtonTypeMomentaryPushIn];
-    [startButton setBezelStyle:NSBezelStyleRounded];
-    [startButton setTarget:self];
-    [startButton setAction:@selector(startVPN:)];
+    /* ── Buttons ── */
+    NSButton *startBtn = [[NSButton alloc]
+        initWithFrame:NSMakeRect(150, 150, 100, 30)];
+    [startBtn setTitle:@"Start"];
+    [startBtn setButtonType:NSButtonTypeMomentaryPushIn];
+    [startBtn setBezelStyle:NSBezelStyleRounded];
+    [startBtn setTarget:self];
+    [startBtn setAction:@selector(startDaemon:)];
 
-    NSButton *stopButton = [[NSButton alloc] initWithFrame:NSMakeRect(150, 100, 100, 30)];
-    [stopButton setTitle:@"Stop VPN"];
-    [stopButton setButtonType:NSButtonTypeMomentaryPushIn];
-    [stopButton setBezelStyle:NSBezelStyleRounded];
-    [stopButton setTarget:self];
-    [stopButton setAction:@selector(stopVPN:)];
+    NSButton *stopBtn = [[NSButton alloc]
+        initWithFrame:NSMakeRect(150, 100, 100, 30)];
+    [stopBtn setTitle:@"Stop"];
+    [stopBtn setButtonType:NSButtonTypeMomentaryPushIn];
+    [stopBtn setBezelStyle:NSBezelStyleRounded];
+    [stopBtn setTarget:self];
+    [stopBtn setAction:@selector(stopDaemon:)];
 
-    NSTextField *statusLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(50, 50, 300, 30)];
-    [statusLabel setStringValue:@"VPN Status: Not Connected"];
-    [statusLabel setBezeled:NO];
-    [statusLabel setDrawsBackground:NO];
-    [statusLabel setEditable:NO];
-    [statusLabel setSelectable:NO];
+    /* ── Status label ── */
+    self.statusLabel = [[NSTextField alloc]
+        initWithFrame:NSMakeRect(50, 50, 300, 30)];
+    [self.statusLabel setStringValue:@"Status: checking…"];
+    [self.statusLabel setBezeled:NO];
+    [self.statusLabel setDrawsBackground:NO];
+    [self.statusLabel setEditable:NO];
+    [self.statusLabel setSelectable:NO];
 
-    NSView *contentView = self.window.contentView;
-    [contentView addSubview:startButton];
-    [contentView addSubview:stopButton];
-    [contentView addSubview:statusLabel];
+    NSView *content = self.window.contentView;
+    [content addSubview:startBtn];
+    [content addSubview:stopBtn];
+    [content addSubview:self.statusLabel];
 
-    // Load VPN configuration
-    [self loadVPNConfiguration];
+    /* Periodically refresh status */
+    self.statusTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
+                                                        target:self
+                                                      selector:@selector(refreshStatus)
+                                                      userInfo:nil
+                                                       repeats:YES];
+    [self refreshStatus];
 }
 
-- (void)loadVPNConfiguration {
-    [NETunnelProviderManager loadAllFromPreferencesWithCompletionHandler:^(NSArray<NETunnelProviderManager *> * _Nullable managers, NSError * _Nullable error) {
-        if (error) {
-            NSLog(@"Error loading VPN managers: %@", error);
-            return;
-        }
+/* ── Daemon control via launchctl ────────────────────────────────── */
 
-        if (managers.count > 0) {
-            self.manager = managers[0];
-        } else {
-            [self createVPNConfiguration];
-        }
-    }];
-}
+- (BOOL)isDaemonRunning {
+    NSTask *task = [[NSTask alloc] init];
+    task.launchPath = @"/bin/launchctl";
+    task.arguments = @[@"list", kDaemonLabel];
 
-- (void)createVPNConfiguration {
-    self.manager = [[NETunnelProviderManager alloc] init];
+    NSPipe *pipe = [NSPipe pipe];
+    task.standardOutput = pipe;
+    task.standardError = [NSFileHandle fileHandleWithNullDevice];
 
-    // Configure the VPN
-    NETunnelProviderProtocol *protocol = [[NETunnelProviderProtocol alloc] init];
-    protocol.providerBundleIdentifier = @"com.netrewire.NetRewirePacketTunnel";
-    protocol.serverAddress = @"10.8.0.1"; // Ubuntu server address
-
-    self.manager.protocolConfiguration = protocol;
-    self.manager.localizedDescription = @"Net-Rewire VPN";
-
-    [self.manager saveToPreferencesWithCompletionHandler:^(NSError * _Nullable error) {
-        if (error) {
-            NSLog(@"Error saving VPN configuration: %@", error);
-        } else {
-            NSLog(@"VPN configuration saved successfully");
-        }
-    }];
-}
-
-- (IBAction)startVPN:(id)sender {
-    if (!self.manager) {
-        NSLog(@"No VPN manager available");
-        return;
+    @try {
+        [task launch];
+        [task waitUntilExit];
+    } @catch (NSException *e) {
+        return NO;
     }
 
-    NSError *error = nil;
-    [self.manager.connection startVPNTunnelWithOptions:@{} andReturnError:&error];
+    return task.terminationStatus == 0;
+}
 
-    if (error) {
-        NSLog(@"Error starting VPN: %@", error);
+- (void)startDaemon:(id)sender {
+    NSTask *task = [[NSTask alloc] init];
+    task.launchPath = @"/bin/launchctl";
+    task.arguments = @[@"load", @"/Library/LaunchDaemons/com.netrewire.daemon.plist"];
+
+    @try {
+        [task launch];
+        [task waitUntilExit];
+    } @catch (NSException *e) {
+        NSLog(@"Failed to start daemon: %@", e);
+    }
+
+    [self refreshStatus];
+}
+
+- (void)stopDaemon:(id)sender {
+    NSTask *task = [[NSTask alloc] init];
+    task.launchPath = @"/bin/launchctl";
+    task.arguments = @[@"unload", @"/Library/LaunchDaemons/com.netrewire.daemon.plist"];
+
+    @try {
+        [task launch];
+        [task waitUntilExit];
+    } @catch (NSException *e) {
+        NSLog(@"Failed to stop daemon: %@", e);
+    }
+
+    [self refreshStatus];
+}
+
+- (void)refreshStatus {
+    if ([self isDaemonRunning]) {
+        self.statusLabel.stringValue = @"Status: Running — SMTP tunnel active";
     } else {
-        NSLog(@"VPN started successfully");
+        self.statusLabel.stringValue = @"Status: Stopped";
     }
-}
-
-- (IBAction)stopVPN:(id)sender {
-    if (!self.manager) {
-        NSLog(@"No VPN manager available");
-        return;
-    }
-
-    [self.manager.connection stopVPNTunnel];
-    NSLog(@"VPN stopped");
 }
 
 - (void)applicationWillTerminate:(NSNotification *)aNotification {
-    // Insert code here to tear down your application
+    [self.statusTimer invalidate];
+    self.statusTimer = nil;
 }
 
 @end
