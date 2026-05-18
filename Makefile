@@ -6,11 +6,17 @@ CFLAGS = -Wall -Wextra -O2 -std=c99
 LDFLAGS =
 
 # Targets
-TARGETS = ubuntu/tunnel_server macos/NetRewirePacketTunnel/pktparse_test
+TARGETS = ubuntu/tunnel_server macos/NetRewirePacketTunnel/pktparse_test macos/NetRewireDaemon/net-rewire-daemon
 
-.PHONY: all clean test
+.PHONY: all clean test daemon install-daemon
 
 all: $(TARGETS)
+
+# macOS daemon (UTUN-based, replaces Network Extension)
+macos/NetRewireDaemon/net-rewire-daemon: macos/NetRewireDaemon/main.c
+	$(CC) $(CFLAGS) -o $@ macos/NetRewireDaemon/main.c $(LDFLAGS) -lresolv
+
+daemon: macos/NetRewireDaemon/net-rewire-daemon
 
 # Ubuntu tunnel server
 ubuntu/tunnel_server: ubuntu/tunnel_server.c
@@ -28,6 +34,7 @@ test: macos/NetRewirePacketTunnel/pktparse_test
 clean:
 	rm -f $(TARGETS)
 	rm -f *.o
+	rm -f macos/NetRewireDaemon/*.o
 
 # Install Ubuntu server dependencies
 ubuntu-deps:
@@ -47,13 +54,14 @@ help:
 	@echo "Net-Rewire Build System"
 	@echo ""
 	@echo "Targets:"
-	@echo "  all          - Build all components"
-	@echo "  test         - Run packet parser tests"
-	@echo "  ubuntu-deps  - Install Ubuntu dependencies"
-	@echo "  ubuntu-setup - Setup Ubuntu server"
-	@echo "  ubuntu-run   - Run Ubuntu tunnel server"
-	@echo "  clean        - Clean build artifacts"
+	@echo "  all           - Build all components"
+	@echo "  daemon        - Build macOS UTUN daemon (no Xcode needed)"
+	@echo "  test          - Run packet parser tests"
+	@echo "  ubuntu-deps   - Install Ubuntu dependencies"
+	@echo "  ubuntu-setup  - Setup Ubuntu server"
+	@echo "  ubuntu-run    - Run Ubuntu tunnel server"
+	@echo "  clean         - Clean build artifacts"
 	@echo ""
-	@echo "For macOS development:"
-	@echo "  - Open macos/NetRewireApp.xcodeproj in Xcode"
-	@echo "  - Build and run the Network Extension target"
+	@echo "macOS daemon (no Apple entitlements needed):"
+	@echo "  make daemon"
+	@echo "  sudo macos/NetRewireDaemon/install-daemon.sh <ubuntu-ip>"
