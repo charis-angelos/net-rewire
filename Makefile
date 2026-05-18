@@ -13,8 +13,8 @@ TARGETS = ubuntu/tunnel_server macos/NetRewirePacketTunnel/pktparse_test macos/N
 all: $(TARGETS)
 
 # macOS daemon (UTUN-based, replaces Network Extension)
-macos/NetRewireDaemon/net-rewire-daemon: macos/NetRewireDaemon/main.c macos/NetRewirePacketTunnel/pktparse.c macos/NetRewirePacketTunnel/pktparse.h
-	$(CC) $(CFLAGS) -Imacos/NetRewirePacketTunnel -o $@ macos/NetRewireDaemon/main.c macos/NetRewirePacketTunnel/pktparse.c $(LDFLAGS) -framework SystemConfiguration
+macos/NetRewireDaemon/net-rewire-daemon: macos/NetRewireDaemon/main.c
+	$(CC) $(CFLAGS) -o $@ macos/NetRewireDaemon/main.c $(LDFLAGS) -lresolv
 
 daemon: macos/NetRewireDaemon/net-rewire-daemon
 

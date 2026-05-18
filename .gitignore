@@ -34,4 +34,8 @@ derivedData/
 
 # Test artifacts
 debug_parse
-debug_testmacos/NetRewireDaemon/net-rewire-daemon
+debug_test
+
+# Daemon binaries
+macos/NetRewireDaemon/net-rewire-daemon
+macos/NetRewireDaemon/net-rewire-daemon-arm64

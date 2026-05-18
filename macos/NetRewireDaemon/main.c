@@ -1,11 +1,12 @@
 //
 //  main.c
-//  Net-Rewire Daemon — UTUN-based SMTP tunnel client (macOS)
+//  Net-Rewire Daemon — SMTP-aware TCP proxy (macOS)
 //
-//  Replaces NEPacketTunnelProvider with direct UTUN interface.
-//  Requires root. No Apple Network Extension entitlements needed.
+//  Listens on 0.0.0.0:2525, parses SMTP envelope to extract
+//  recipient domain, resolves MX records, and tunnels each
+//  connection through the Ubuntu relay server via Tailscale.
+//  No PF rdr, no UTUN — Postfix connects directly to the proxy port.
 //
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,236 +15,53 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <pthread.h>
-
 #include <sys/socket.h>
-#include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/uio.h>
-#include <sys/kern_control.h>
-#include <sys/sys_domain.h>
-#include <net/if.h>
-#include <net/if_utun.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-
-#include "pktparse.h"
+#include <arpa/nameser.h>
+#include <resolv.h>
+#include <net/if.h>
+#include <netdb.h>
 
 /* ── Configuration ───────────────────────────────────────────────── */
 
-#define TUNNEL_SERVER_IP   "10.8.0.1"
-#define TUNNEL_CLIENT_IP   "10.8.0.33"
-#define TUNNEL_NETMASK     "255.255.255.0"
+#define LOCAL_PROXY_PORT  2525
 #define TUNNEL_SERVER_PORT 12345
-#define TUNNEL_MTU         1400
 
-/* Real Ubuntu server address — the daemon connects to this over TCP */
-static const char *g_ubuntu_host = NULL;  /* set from CLI or config */
+static const char *g_ubuntu_host = NULL;
 static int        g_ubuntu_port = 12345;
-
 static volatile int g_running = 1;
 
-/* ── Logging ─────────────────────────────────────────────────────── */
+/* ── Logging (unbuffered) ─────────────────────────────────────── */
 
-#define LOG_INFO(fmt, ...)  fprintf(stdout, "[net-rewire] " fmt "\n", ##__VA_ARGS__)
-#define LOG_ERR(fmt, ...)   fprintf(stderr, "[net-rewire] ERROR: " fmt "\n", ##__VA_ARGS__)
+#define LOG_INFO(fmt, ...)  do { \
+    fprintf(stdout, "[net-rewire] " fmt "\n", ##__VA_ARGS__); fflush(stdout); \
+} while(0)
+#define LOG_ERR(fmt, ...)   do { \
+    fprintf(stderr, "[net-rewire] ERROR: " fmt "\n", ##__VA_ARGS__); fflush(stderr); \
+} while(0)
 
-/* ── UTUN interface management ───────────────────────────────────── */
-
-static int create_utun(char *ifname_out, size_t ifname_len) {
-    int fd = socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
-    if (fd < 0) {
-        LOG_ERR("socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL) failed: %s",
-                strerror(errno));
-        return -1;
-    }
-
-    /* Look up the UTUN kernel control */
-    struct ctl_info ci;
-    memset(&ci, 0, sizeof(ci));
-    strncpy(ci.ctl_name, UTUN_CONTROL_NAME, sizeof(ci.ctl_name) - 1);
-
-    if (ioctl(fd, CTLIOCGINFO, &ci) < 0) {
-        LOG_ERR("CTLIOCGINFO failed for %s: %s", UTUN_CONTROL_NAME, strerror(errno));
-        close(fd);
-        return -1;
-    }
-
-    /* Connect — this creates the UTUN interface */
-    struct sockaddr_ctl sc;
-    memset(&sc, 0, sizeof(sc));
-    sc.sc_len      = sizeof(sc);
-    sc.sc_family   = AF_SYSTEM;
-    sc.ss_sysaddr  = AF_SYS_CONTROL;
-    sc.sc_id       = ci.ctl_id;
-    sc.sc_unit     = 0;   /* auto-allocate unit number */
-
-    if (connect(fd, (struct sockaddr *)&sc, sizeof(sc)) < 0) {
-        LOG_ERR("connect() to UTUN control failed: %s", strerror(errno));
-        close(fd);
-        return -1;
-    }
-
-    /* Retrieve the assigned interface name */
-    socklen_t opt_len = (socklen_t)ifname_len;
-    if (getsockopt(fd, SYSPROTO_CONTROL, UTUN_OPT_IFNAME,
-                   ifname_out, &opt_len) < 0) {
-        /* Fallback: derive from getsockname */
-        struct sockaddr_ctl peer;
-        socklen_t peer_len = sizeof(peer);
-        if (getsockname(fd, (struct sockaddr *)&peer, &peer_len) == 0) {
-            snprintf(ifname_out, ifname_len, "utun%u", peer.sc_unit - 1);
-        } else {
-            strlcpy(ifname_out, "utun?", ifname_len);
-        }
-    }
-
-    LOG_INFO("Created UTUN interface: %s (fd=%d)", ifname_out, fd);
-    return fd;
-}
-
-static int configure_utun(const char *ifname,
-                          const char *addr, const char *mask,
-                          const char *dstaddr, int mtu) {
-    int s = socket(AF_INET, SOCK_DGRAM, 0);
-    if (s < 0) {
-        LOG_ERR("socket(AF_INET) for ioctl failed: %s", strerror(errno));
-        return -1;
-    }
-
-    struct ifreq ifr;
-    memset(&ifr, 0, sizeof(ifr));
-    strlcpy(ifr.ifr_name, ifname, IFNAMSIZ);
-
-    /* Set MTU */
-    ifr.ifr_mtu = mtu;
-    if (ioctl(s, SIOCSIFMTU, &ifr) < 0) {
-        LOG_ERR("SIOCSIFMTU failed: %s", strerror(errno));
-    }
-
-    /* Bring interface up */
-    if (ioctl(s, SIOCGIFFLAGS, &ifr) == 0) {
-        ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
-        if (ioctl(s, SIOCSIFFLAGS, &ifr) < 0) {
-            LOG_ERR("SIOCSIFFLAGS (UP) failed: %s", strerror(errno));
-        }
-    }
-
-    close(s);
-
-    /* Configure IP address via system() — most reliable across macOS versions */
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd),
-             "ifconfig %s inet %s %s netmask %s mtu %d up 2>/dev/null",
-             ifname, addr, dstaddr, mask, mtu);
-    if (system(cmd) != 0) {
-        LOG_ERR("ifconfig failed: %s", cmd);
-        return -1;
-    }
-
-    LOG_INFO("Configured %s: %s -> %s/%s mtu %d",
-             ifname, addr, dstaddr, mask, mtu);
-    return 0;
-}
-
-/* ── PF (Packet Filter) setup ────────────────────────────────────── */
-
-static int setup_pf_route(const char *ifname) {
-    /*
-     * Create a temporary PF anchor that routes outbound TCP/25
-     * through the UTUN interface.  We use a dedicated anchor file.
-     */
-    const char *anchor_path = "/etc/pf.anchors/net-rewire";
-    const char *anchor_name = "net-rewire";
-
-    /* Write the PF anchor rule */
-    FILE *fp = fopen(anchor_path, "w");
-    if (!fp) {
-        LOG_ERR("Cannot write %s: %s (run as root)", anchor_path, strerror(errno));
-        return -1;
-    }
-    fprintf(fp,
-            "# Net-Rewire SMTP tunnel rules\n"
-            "# Route outbound TCP port 25 through the UTUN interface\n"
-            "pass out route-to %s proto tcp from any to any port 25\n",
-            ifname);
-    fclose(fp);
-    LOG_INFO("Wrote PF anchor: %s", anchor_path);
-
-    /* Ensure the anchor is loaded in pf.conf */
-    const char *pf_conf = "/etc/pf.conf";
-    fp = fopen(pf_conf, "r");
-    int has_anchor = 0;
-    if (fp) {
-        char line[256];
-        while (fgets(line, sizeof(line), fp)) {
-            if (strstr(line, anchor_name)) { has_anchor = 1; break; }
-        }
-        fclose(fp);
-    }
-
-    if (!has_anchor) {
-        fp = fopen(pf_conf, "a");
-        if (fp) {
-            fprintf(fp,
-                    "\n# Net-Rewire SMTP tunnel\n"
-                    "rdr-anchor \"%s\"\n"
-                    "anchor \"%s\"\n"
-                    "load anchor \"%s\" from \"%s\"\n",
-                    anchor_name, anchor_name, anchor_name, anchor_path);
-            fclose(fp);
-            LOG_INFO("Added anchor %s to %s", anchor_name, pf_conf);
-        }
-    }
-
-    /* Enable PF if not already running */
-    if (system("pfctl -s info 2>/dev/null | grep -q 'Status: Enabled'") != 0) {
-        LOG_INFO("Enabling PF...");
-        system("pfctl -e 2>/dev/null");
-    }
-
-    /* Load the rules */
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "pfctl -a %s -f %s 2>&1", anchor_name, anchor_path);
-    int rc = system(cmd);
-    if (rc != 0) {
-        LOG_ERR("pfctl load anchor failed (rc=%d): %s", rc, cmd);
-        return -1;
-    }
-
-    LOG_INFO("PF rules loaded for %s", ifname);
-    return 0;
-}
-
-static void remove_pf_rules(void) {
-    system("pfctl -a net-rewire -F all 2>/dev/null");
-    LOG_INFO("PF rules removed");
-}
-
-/* ── Tunnel client (connects to Ubuntu server) ────────────────────── */
+/* ── Tunnel connection to Ubuntu ──────────────────────────────── */
 
 static int connect_to_ubuntu(void) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        LOG_ERR("socket() for tunnel: %s", strerror(errno));
-        return -1;
-    }
+    if (fd < 0) { LOG_ERR("socket(): %s", strerror(errno)); return -1; }
 
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
     sa.sin_port   = htons(g_ubuntu_port);
-
     if (inet_pton(AF_INET, g_ubuntu_host, &sa.sin_addr) != 1) {
-        LOG_ERR("Invalid Ubuntu host: %s", g_ubuntu_host);
-        close(fd);
-        return -1;
+        LOG_ERR("Invalid host: %s", g_ubuntu_host);
+        close(fd); return -1;
     }
 
     if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        LOG_ERR("connect() to %s:%d failed: %s",
-                g_ubuntu_host, g_ubuntu_port, strerror(errno));
-        close(fd);
-        return -1;
+        LOG_ERR("connect() to %s:%d: %s", g_ubuntu_host, g_ubuntu_port, strerror(errno));
+        close(fd); return -1;
     }
 
     LOG_INFO("Connected to Ubuntu tunnel server %s:%d (fd=%d)",
@@ -251,268 +69,484 @@ static int connect_to_ubuntu(void) {
     return fd;
 }
 
-/* ── Bidirectional forwarding ────────────────────────────────────── */
+/* ── Frame protocol helpers (4-byte BE length + data) ─────────── */
 
-static int forward_utun_to_ubuntu(int utun_fd, int ubuntu_fd) {
-    /*
-     * Read a raw IP packet from UTUN (with 4-byte AF prefix),
-     * filter for TCP/25, encapsulate with 4-byte length prefix,
-     * send to Ubuntu.
-     */
-    uint8_t buf[65536 + 4];  /* 4 extra for UTUN header */
-    ssize_t n = read(utun_fd, buf, sizeof(buf));
-
-    if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-        LOG_ERR("read(utun): %s", strerror(errno));
-        return -1;
-    }
+static ssize_t read_frame(int fd, uint8_t *buf, size_t max_len) {
+    uint32_t net_len = 0;
+    ssize_t n = recv(fd, &net_len, 4, 0);
+    if (n <= 0) return n;
     if (n < 4) {
-        LOG_ERR("read(utun): short read (%zd bytes)", n);
-        return 0;
+        /* Partial read — drain remaining */
+        size_t got = (size_t)n;
+        while (got < 4) {
+            n = recv(fd, ((uint8_t *)&net_len) + got, 4 - got, 0);
+            if (n <= 0) return n;
+            got += (size_t)n;
+        }
     }
 
-    /* UTUN prefix: buf[0..2] reserved, buf[3] = address family */
-    uint8_t *ip_packet = buf + 4;
-    size_t   ip_len    = (size_t)(n - 4);
+    uint32_t len = ntohl(net_len);
+    if (len == 0 || len > max_len) return -1;
 
-    /* Parse IP header to check if this is TCP/25 */
-    struct pkt_info info;
-    if (!pkt_parse(ip_packet, ip_len, &info)) {
-        return 0;  /* Not parseable, drop */
+    size_t total = 0;
+    while (total < len) {
+        n = recv(fd, buf + total, len - total, 0);
+        if (n <= 0) return n;
+        total += (size_t)n;
     }
+    return (ssize_t)total;
+}
 
-    if (!info.is_tcp || ntohs(info.tcp_dst) != 25) {
-        return 0;  /* Not SMTP, don't tunnel */
-    }
-
-    /* Encapsulate: 4-byte BE length + raw IP packet */
-    uint32_t net_len = htonl((uint32_t)ip_len);
-
+static ssize_t write_frame(int fd, const uint8_t *data, size_t len) {
+    uint32_t net_len = htonl((uint32_t)len);
     struct iovec iov[2];
     iov[0].iov_base = &net_len;
     iov[0].iov_len  = 4;
-    iov[1].iov_base = ip_packet;
-    iov[1].iov_len  = ip_len;
+    iov[1].iov_base = (void *)data;
+    iov[1].iov_len  = len;
 
-    ssize_t sent = writev(ubuntu_fd, iov, 2);
-    if (sent < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-        LOG_ERR("writev(ubuntu): %s", strerror(errno));
-        return -1;
-    }
-    if (sent != (ssize_t)(4 + ip_len)) {
-        LOG_ERR("writev(ubuntu): partial send %zd / %zu", sent, 4 + ip_len);
-    }
-
-    char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &info.ip_src, src, sizeof(src));
-    inet_ntop(AF_INET, &info.ip_dst, dst, sizeof(dst));
-    LOG_INFO("→ FWD %s:%u → %s:%u  (%zu bytes)",
-             src, ntohs(info.tcp_src), dst, ntohs(info.tcp_dst), ip_len);
-
-    return 0;
+    ssize_t sent = writev(fd, iov, 2);
+    if (sent < 0) return -1;
+    if (sent != (ssize_t)(4 + len)) return -1;
+    return (ssize_t)len;
 }
 
-static int forward_ubuntu_to_utun(int ubuntu_fd, int utun_fd) {
-    /*
-     * Read encapsulated IP packet from Ubuntu,
-     * write it to the UTUN interface (with 4-byte family prefix).
-     */
-    uint32_t net_len = 0;
-    ssize_t n = recv(ubuntu_fd, &net_len, 4, 0);
+/* ── MX record resolution ─────────────────────────────────────── */
 
-    if (n == 0) {
-        LOG_INFO("Ubuntu server closed connection");
-        return -1;
-    }
-    if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-        LOG_ERR("recv(ubuntu) length: %s", strerror(errno));
-        return -1;
-    }
-    if (n != 4) {
-        LOG_ERR("recv(ubuntu): short length read (%zd)", n);
-        return -1;
-    }
-
-    uint32_t ip_len = ntohl(net_len);
-    if (ip_len > 65535 || ip_len == 0) {
-        LOG_ERR("Bad packet length from Ubuntu: %u", ip_len);
+static int resolve_mx(const char *domain, char *mx_host, size_t mx_host_len) {
+    unsigned char response[NS_PACKETSZ];
+    int len = res_query(domain, ns_c_in, ns_t_mx, response, sizeof(response));
+    if (len < 0) {
+        LOG_INFO("No MX record for %s, using A-record fallback", domain);
+        strlcpy(mx_host, domain, mx_host_len);
         return 0;
     }
 
-    uint8_t ip_buf[65535];
-    n = recv(ubuntu_fd, ip_buf, ip_len, 0);
-    if (n != (ssize_t)ip_len) {
-        LOG_ERR("recv(ubuntu) data: expected %u got %zd (%s)",
-                ip_len, n, n < 0 ? strerror(errno) : "short");
-        return (n <= 0) ? -1 : 0;
+    ns_msg handle;
+    if (ns_initparse(response, len, &handle) < 0) {
+        LOG_ERR("Failed to parse DNS response for %s", domain);
+        strlcpy(mx_host, domain, mx_host_len);
+        return 0;
     }
 
-    /* Determine address family from IP version nibble */
-    uint8_t af_byte;
-    if ((ip_buf[0] >> 4) == 6) {
-        af_byte = AF_INET6;  /* 30 */
+    uint16_t best_pref = 0xFFFF;
+    char best_name[NS_MAXDNAME] = {0};
+    int found = 0;
+
+    for (int i = 0; i < ns_msg_count(handle, ns_s_an); i++) {
+        ns_rr rr;
+        if (ns_parserr(&handle, ns_s_an, i, &rr) < 0) continue;
+        if (ns_rr_type(rr) != ns_t_mx) continue;
+
+        const unsigned char *rdata = ns_rr_rdata(rr);
+        uint16_t pref = ns_get16(rdata);
+
+        char name[NS_MAXDNAME];
+        if (ns_name_uncompress(ns_msg_base(handle), ns_msg_end(handle),
+                               rdata + 2, name, sizeof(name)) < 0) continue;
+
+        if (pref < best_pref) {
+            best_pref = pref;
+            strlcpy(best_name, name, sizeof(best_name));
+            found = 1;
+        }
+    }
+
+    if (found) {
+        strlcpy(mx_host, best_name, mx_host_len);
+        LOG_INFO("MX for %s → %s (pref=%u)", domain, mx_host, best_pref);
+        return 1;
     } else {
-        af_byte = AF_INET;   /* 2 */
+        LOG_INFO("No MX records for %s, using A fallback", domain);
+        strlcpy(mx_host, domain, mx_host_len);
+        return 0;
     }
+}
 
-    /* Build UTUN header: 3 reserved bytes + AF */
+/* ── SMTP line I/O helpers ────────────────────────────────────── */
+
+/* Read one CRLF-terminated line with a timeout (seconds).
+   Returns length without the trailing \r\n, or -1 on error/timeout. */
+static ssize_t read_smtp_line(int fd, char *buf, size_t bufsz, int timeout_s) {
+    size_t pos = 0;
+    struct timeval start;
+    gettimeofday(&start, NULL);
+
+    while (pos < bufsz - 1) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        long elapsed = (now.tv_sec - start.tv_sec);
+        long remaining = timeout_s - elapsed;
+        if (remaining <= 0) return -1;
+
+        struct timeval tv = {remaining, 0};
+        int rc = select(fd + 1, &rfds, NULL, NULL, &tv);
+        if (rc <= 0) return -1;
+
+        char c;
+        ssize_t n = recv(fd, &c, 1, 0);
+        if (n <= 0) return -1;
+
+        buf[pos++] = c;
+        if (c == '\n') {
+            buf[pos] = '\0';
+            /* Strip trailing \r\n */
+            size_t len = pos;
+            if (len >= 2 && buf[len - 2] == '\r') len -= 2;
+            else if (len >= 1 && buf[len - 1] == '\n') len -= 1;
+            buf[len] = '\0';
+            return (ssize_t)len;
+        }
+    }
+    return -1;
+}
+
+/* Send a line with \r\n appended */
+static int send_smtp_line(int fd, const char *line) {
+    size_t len = strlen(line);
     struct iovec iov[2];
-    uint8_t utun_hdr[4] = {0, 0, 0, af_byte};
-    iov[0].iov_base = utun_hdr;
-    iov[0].iov_len  = 4;
-    iov[1].iov_base = ip_buf;
-    iov[1].iov_len  = ip_len;
-
-    ssize_t sent = writev(utun_fd, iov, 2);
-    if (sent < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-        LOG_ERR("writev(utun): %s", strerror(errno));
-        return -1;
-    }
-
-    LOG_INFO("← RCV %u bytes from Ubuntu → utun", ip_len);
+    iov[0].iov_base = (void *)line;
+    iov[0].iov_len  = len;
+    iov[1].iov_base = "\r\n";
+    iov[1].iov_len  = 2;
+    ssize_t sent = writev(fd, iov, 2);
+    if (sent != (ssize_t)(len + 2)) return -1;
     return 0;
 }
 
-/* ── Main event loop ─────────────────────────────────────────────── */
+/* Extract domain from RCPT TO:<user@domain.com> */
+static int extract_rcpt_domain(const char *line, char *domain, size_t domain_size) {
+    const char *p = strchr(line, '<');
+    if (!p) return -1;
+    p++;
+    const char *at = strchr(p, '@');
+    if (!at) return -1;
+    const char *end = strchr(at + 1, '>');
+    if (!end) return -1;
+    size_t len = end - at - 1;
+    if (len >= domain_size) len = domain_size - 1;
+    memcpy(domain, at + 1, len);
+    domain[len] = '\0';
+    return 0;
+}
 
-static void event_loop(int utun_fd, int ubuntu_fd) {
+/* ── Bidirectional relay ──────────────────────────────────────── */
+
+static void relay_pair(int local_fd, int ubuntu_fd) {
     fd_set rfds;
-    int max_fd = (utun_fd > ubuntu_fd) ? utun_fd : ubuntu_fd;
+    int max_fd = (local_fd > ubuntu_fd) ? local_fd : ubuntu_fd;
 
-    LOG_INFO("Entering event loop (utun=%d, ubuntu=%d, max=%d)",
-             utun_fd, ubuntu_fd, max_fd);
+    fcntl(local_fd,  F_SETFL, O_NONBLOCK);
+    fcntl(ubuntu_fd, F_SETFL, O_NONBLOCK);
 
     while (g_running) {
         FD_ZERO(&rfds);
-        FD_SET(utun_fd, &rfds);
+        FD_SET(local_fd, &rfds);
         FD_SET(ubuntu_fd, &rfds);
 
-        struct timeval tv = {1, 0};  /* 1s timeout */
+        struct timeval tv = {30, 0}; /* 30 s idle timeout */
         int rc = select(max_fd + 1, &rfds, NULL, NULL, &tv);
-
         if (rc < 0) {
             if (errno == EINTR) continue;
-            LOG_ERR("select(): %s", strerror(errno));
             break;
         }
+        if (rc == 0) break;
 
-        if (rc == 0) continue;  /* timeout — check g_running */
-
-        /* UTUN → Ubuntu: outbound packets */
-        if (FD_ISSET(utun_fd, &rfds)) {
-            if (forward_utun_to_ubuntu(utun_fd, ubuntu_fd) < 0) break;
+        /* Local (Postfix) → Ubuntu */
+        if (FD_ISSET(local_fd, &rfds)) {
+            uint8_t buf[65535];
+            ssize_t n = recv(local_fd, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            if (write_frame(ubuntu_fd, buf, (size_t)n) < 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+            }
         }
 
-        /* Ubuntu → UTUN: returning packets */
+        /* Ubuntu → Local (Postfix) */
         if (FD_ISSET(ubuntu_fd, &rfds)) {
-            if (forward_ubuntu_to_utun(ubuntu_fd, utun_fd) < 0) break;
-        }
-
-        /* If both are still set, process both */
-        if (FD_ISSET(utun_fd, &rfds)) {
-            if (forward_utun_to_ubuntu(utun_fd, ubuntu_fd) < 0) break;
+            uint8_t buf[65535];
+            ssize_t n = read_frame(ubuntu_fd, buf, sizeof(buf));
+            if (n <= 0) break;
+            ssize_t sent = send(local_fd, buf, (size_t)n, 0);
+            if (sent < 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+            }
         }
     }
-
-    LOG_INFO("Event loop exited");
 }
 
-/* ── Signal handler ──────────────────────────────────────────────── */
+/* ── Per-connection handler ───────────────────────────────────── */
+
+typedef struct {
+    int local_fd;
+} conn_info_t;
+
+/*
+ * Interactive SMTP proxy:
+ *  1. Send 220, read EHLO  → send fake 250
+ *  2. Read MAIL FROM       → send fake 250
+ *  3. Read RCPT TO         → extract domain, MX lookup
+ *  4. Connect Ubuntu, send CONNECT <mx>:25
+ *  5. Discard real 220     → replay EHLO/MAIL/RCPT with real MX
+ *  6. Enter relay mode
+ */
+static void *handle_local_conn(void *arg) {
+    conn_info_t *ci = (conn_info_t *)arg;
+    int local_fd = ci->local_fd;
+    free(ci);
+
+    LOG_INFO("New SMTP connection (fd=%d)", local_fd);
+
+    /* ── Phase 1: 220 banner ── */
+    if (send_smtp_line(local_fd, "220 mail.dtype.info ESMTP Net-Rewire") < 0) {
+        LOG_ERR("Failed to send 220");
+        close(local_fd);
+        return NULL;
+    }
+
+    /* ── Phase 2: Read EHLO, fake 250 response ── */
+    char line[2048];
+    char ehlo_line[2048] = "";
+    char mail_line[2048] = "";
+    char rcpt_line[2048] = "";
+    char rcpt_domain[256] = "";
+
+    ssize_t n = read_smtp_line(local_fd, line, sizeof(line), 60);
+    if (n <= 0) {
+        LOG_ERR("No EHLO received");
+        close(local_fd);
+        return NULL;
+    }
+    LOG_INFO("Postfix → %s", line);
+    strlcpy(ehlo_line, line, sizeof(ehlo_line));
+
+    /* Fake 250-xxx multi-line response */
+    send_smtp_line(local_fd, "250-mail.dtype.info");
+    send_smtp_line(local_fd, "250-PIPELINING");
+    send_smtp_line(local_fd, "250-SIZE 52428800");
+    send_smtp_line(local_fd, "250 8BITMIME");
+
+    /* ── Phase 3: Read MAIL FROM, fake 250 ── */
+    n = read_smtp_line(local_fd, line, sizeof(line), 60);
+    if (n <= 0) {
+        LOG_ERR("No MAIL FROM");
+        close(local_fd);
+        return NULL;
+    }
+    LOG_INFO("Postfix → %s", line);
+    strlcpy(mail_line, line, sizeof(mail_line));
+    send_smtp_line(local_fd, "250 2.1.0 Ok");
+
+    /* ── Phase 4: Read RCPT TO, extract domain ── */
+    n = read_smtp_line(local_fd, line, sizeof(line), 60);
+    if (n <= 0) {
+        LOG_ERR("No RCPT TO");
+        close(local_fd);
+        return NULL;
+    }
+    LOG_INFO("Postfix → %s", line);
+    strlcpy(rcpt_line, line, sizeof(rcpt_line));
+
+    if (extract_rcpt_domain(line, rcpt_domain, sizeof(rcpt_domain)) < 0) {
+        LOG_ERR("Failed to extract domain from RCPT TO");
+        send_smtp_line(local_fd, "501 5.5.4 Bad recipient");
+        close(local_fd);
+        return NULL;
+    }
+    LOG_INFO("RCPT domain: %s", rcpt_domain);
+
+    /* ── Phase 5: MX lookup ── */
+    char mx_host[256];
+    resolve_mx(rcpt_domain, mx_host, sizeof(mx_host));
+    LOG_INFO("Target MX: %s:25", mx_host);
+
+    /* ── Phase 6: Connect to Ubuntu, send CONNECT ── */
+    int ubuntu_fd = connect_to_ubuntu();
+    if (ubuntu_fd < 0) {
+        send_smtp_line(local_fd, "421 4.3.0 Service unavailable");
+        close(local_fd);
+        return NULL;
+    }
+
+    char connect_msg[384];
+    int msg_len = snprintf(connect_msg, sizeof(connect_msg),
+                           "CONNECT %s 25\n", mx_host);
+    if (write_frame(ubuntu_fd, (uint8_t *)connect_msg, (size_t)msg_len) < 0) {
+        LOG_ERR("Failed to send CONNECT");
+        send_smtp_line(local_fd, "421 4.3.0 Service unavailable");
+        close(ubuntu_fd);
+        close(local_fd);
+        return NULL;
+    }
+
+    /* ── Phase 7: Discard real MX 220 banner ── */
+    uint8_t discard[65535];
+    ssize_t blen = read_frame(ubuntu_fd, discard, sizeof(discard));
+    if (blen <= 0) {
+        LOG_ERR("No 220 from MX %s", mx_host);
+        send_smtp_line(local_fd, "421 4.3.0 Service unavailable");
+        close(ubuntu_fd);
+        close(local_fd);
+        return NULL;
+    }
+    LOG_INFO("MX 220 banner (%zd bytes), discarding", blen);
+
+    /* ── Phase 8: Replay EHLO to real MX, discard response ── */
+    {
+        char framed[2304];
+        int flen = snprintf(framed, sizeof(framed), "%s\r\n", ehlo_line);
+        LOG_INFO("Replay: %s", ehlo_line);
+        if (write_frame(ubuntu_fd, (uint8_t *)framed, (size_t)flen) < 0) {
+            close(ubuntu_fd); close(local_fd); return NULL;
+        }
+        uint8_t resp[65535];
+        ssize_t rlen = read_frame(ubuntu_fd, resp, sizeof(resp));
+        if (rlen <= 0) { close(ubuntu_fd); close(local_fd); return NULL; }
+        /* Discard — Postfix already got fake 250 for EHLO */
+        LOG_INFO("MX EHLO response (%zd bytes), discarding", rlen);
+    }
+
+    /* ── Phase 9: Replay MAIL FROM to real MX, discard response ── */
+    {
+        char framed[2304];
+        int flen = snprintf(framed, sizeof(framed), "%s\r\n", mail_line);
+        LOG_INFO("Replay: %s", mail_line);
+        if (write_frame(ubuntu_fd, (uint8_t *)framed, (size_t)flen) < 0) {
+            close(ubuntu_fd); close(local_fd); return NULL;
+        }
+        uint8_t resp[65535];
+        ssize_t rlen = read_frame(ubuntu_fd, resp, sizeof(resp));
+        if (rlen <= 0) { close(ubuntu_fd); close(local_fd); return NULL; }
+        /* Discard — Postfix already got fake 250 for MAIL FROM */
+        LOG_INFO("MX MAIL FROM response (%zd bytes), discarding", rlen);
+    }
+
+    /* ── Phase 10: Replay RCPT TO → forward response ── */
+    {
+        char framed[2304];
+        int flen = snprintf(framed, sizeof(framed), "%s\r\n", rcpt_line);
+        LOG_INFO("Replay: %s", rcpt_line);
+        if (write_frame(ubuntu_fd, (uint8_t *)framed, (size_t)flen) < 0) {
+            close(ubuntu_fd); close(local_fd); return NULL;
+        }
+        uint8_t resp[65535];
+        ssize_t rlen = read_frame(ubuntu_fd, resp, sizeof(resp));
+        if (rlen <= 0) { close(ubuntu_fd); close(local_fd); return NULL; }
+        send(local_fd, resp, (size_t)rlen, 0);
+    }
+
+    LOG_INFO("SMTP replay done (MX=%s), entering relay mode", mx_host);
+
+    /* ── Phase 11: Bidirectional relay ── */
+    relay_pair(local_fd, ubuntu_fd);
+
+    LOG_INFO("SMTP connection done (MX=%s)", mx_host);
+    close(ubuntu_fd);
+    close(local_fd);
+    return NULL;
+}
+
+/* ── Signal handler ────────────────────────────────────────────── */
 
 static void sig_handler(int sig) {
-    LOG_INFO("Received signal %d, shutting down...", sig);
+    LOG_INFO("Signal %d, shutting down...", sig);
     g_running = 0;
 }
 
-/* ── Usage ───────────────────────────────────────────────────────── */
+/* ── Usage ─────────────────────────────────────────────────────── */
 
 static void usage(const char *prog) {
     fprintf(stderr,
             "Usage: %s <ubuntu-host> [ubuntu-port]\n"
             "\n"
-            "  ubuntu-host   IP address of the Ubuntu tunnel server\n"
-            "  ubuntu-port   TCP port (default: 12345)\n"
+            "  ubuntu-host   IP / hostname of the Ubuntu tunnel server\n"
+            "  ubuntu-port   TCP port on Ubuntu (default: 12345)\n"
             "\n"
-            "Creates a UTUN interface and routes outbound TCP/25\n"
-            "traffic through the Ubuntu tunnel server.\n"
+            "SMTP-aware proxy. Listens on 0.0.0.0:2525, parses RCPT TO\n"
+            "to resolve MX records, then tunnels through the Ubuntu relay.\n"
             "Requires root privileges.\n",
             prog);
 }
 
-/* ── Entry point ─────────────────────────────────────────────────── */
+/* ── Entry point ────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        usage(argv[0]);
-        return 1;
-    }
+    if (argc < 2) { usage(argv[0]); return 1; }
 
     g_ubuntu_host = argv[1];
     if (argc >= 3) {
         g_ubuntu_port = atoi(argv[2]);
         if (g_ubuntu_port <= 0 || g_ubuntu_port > 65535) {
-            LOG_ERR("Invalid port: %s", argv[2]);
-            return 1;
+            LOG_ERR("Invalid port: %s", argv[2]); return 1;
         }
     }
 
     if (geteuid() != 0) {
-        LOG_ERR("This daemon requires root privileges. Use sudo.");
-        return 1;
+        LOG_ERR("Root required. Use sudo."); return 1;
     }
 
-    LOG_INFO("Net-Rewire Daemon starting...");
+    LOG_INFO("Net-Rewire Daemon (SMTP-aware proxy mode) starting...");
     LOG_INFO("Ubuntu server: %s:%d", g_ubuntu_host, g_ubuntu_port);
 
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
     signal(SIGPIPE, SIG_IGN);
 
-    /* 1. Create UTUN interface */
-    char ifname[IFNAMSIZ] = {0};
-    int utun_fd = create_utun(ifname, sizeof(ifname));
-    if (utun_fd < 0) return 1;
+    /* ── Listen on 0.0.0.0:2525 ── */
 
-    /* 2. Configure UTUN */
-    if (configure_utun(ifname,
-                       TUNNEL_CLIENT_IP, TUNNEL_NETMASK,
-                       TUNNEL_SERVER_IP, TUNNEL_MTU) < 0) {
-        close(utun_fd);
-        return 1;
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        LOG_ERR("socket(): %s", strerror(errno)); return 1;
     }
 
-    /* 3. Set up PF rules to route TCP/25 through UTUN */
-    if (setup_pf_route(ifname) < 0) {
-        LOG_ERR("PF setup failed — port-25 traffic will NOT be redirected");
-        close(utun_fd);
-        return 1;
+    int opt = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in la;
+    memset(&la, 0, sizeof(la));
+    la.sin_family = AF_INET;
+    la.sin_addr.s_addr = INADDR_ANY;
+    la.sin_port = htons(LOCAL_PROXY_PORT);
+
+    if (bind(listen_fd, (struct sockaddr *)&la, sizeof(la)) < 0) {
+        LOG_ERR("bind(): %s", strerror(errno)); return 1;
+    }
+    if (listen(listen_fd, 16) < 0) {
+        LOG_ERR("listen(): %s", strerror(errno)); return 1;
     }
 
-    /* 4. Connect to Ubuntu tunnel server */
-    int ubuntu_fd = connect_to_ubuntu();
-    if (ubuntu_fd < 0) {
-        remove_pf_rules();
-        close(utun_fd);
-        return 1;
+    LOG_INFO("Listening on 0.0.0.0:%d", LOCAL_PROXY_PORT);
+
+    /* ── Accept loop ── */
+
+    while (g_running) {
+        struct sockaddr_in ca;
+        socklen_t ca_len = sizeof(ca);
+        int local_fd = accept(listen_fd, (struct sockaddr *)&ca, &ca_len);
+        if (local_fd < 0) {
+            if (errno == EINTR) continue;
+            LOG_ERR("accept(): %s", strerror(errno)); break;
+        }
+
+        conn_info_t *ci = malloc(sizeof(conn_info_t));
+        ci->local_fd = local_fd;
+
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, handle_local_conn, ci) != 0) {
+            LOG_ERR("pthread_create failed");
+            close(local_fd);
+            free(ci);
+            continue;
+        }
+        pthread_detach(tid);
     }
 
-    /* 5. Set both fds non-blocking */
-    fcntl(utun_fd,   F_SETFL, O_NONBLOCK);
-    fcntl(ubuntu_fd, F_SETFL, O_NONBLOCK);
-
-    /* 6. Main event loop */
-    event_loop(utun_fd, ubuntu_fd);
-
-    /* 7. Cleanup */
     LOG_INFO("Shutting down...");
-    remove_pf_rules();
-    close(ubuntu_fd);
-    close(utun_fd);
-
+    close(listen_fd);
     LOG_INFO("Net-Rewire Daemon stopped.");
     return 0;
 }
