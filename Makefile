@@ -8,11 +8,11 @@ LDFLAGS =
 # Targets
 TARGETS = ubuntu/tunnel_server macos/NetRewirePacketTunnel/pktparse_test macos/NetRewireDaemon/net-rewire-daemon
 
-.PHONY: all clean test daemon install-daemon
+.PHONY: all clean test daemon vps-setup
 
 all: $(TARGETS)
 
-# macOS daemon (UTUN-based, replaces Network Extension)
+# macOS daemon (SMTP-aware proxy)
 macos/NetRewireDaemon/net-rewire-daemon: macos/NetRewireDaemon/main.c
 	$(CC) $(CFLAGS) -o $@ macos/NetRewireDaemon/main.c $(LDFLAGS) -lresolv
 
@@ -36,32 +36,23 @@ clean:
 	rm -f *.o
 	rm -f macos/NetRewireDaemon/*.o
 
-# Install Ubuntu server dependencies
-ubuntu-deps:
-	sudo apt-get update
-	sudo apt-get install -y build-essential net-tools tcpdump iptables-persistent
-
-# Setup Ubuntu server
-ubuntu-setup: ubuntu-deps ubuntu/tunnel_server
-	sudo chmod +x ubuntu/setup-vpn-forward.sh
-	sudo ./ubuntu/setup-vpn-forward.sh
-
-# Run Ubuntu server
-ubuntu-run: ubuntu/tunnel_server
-	sudo ./ubuntu/tunnel_server
+vps-setup: ubuntu/tunnel_server
+	@echo "VPS build ready. Deploy with:"
+	@echo "  scp ubuntu/* root@<vps>:~/net-rewire/"
+	@echo "  ssh root@<vps> 'cd net-rewire && MAILCOW_TS_IP=<ip> bash setup.sh'"
 
 help:
 	@echo "Net-Rewire Build System"
 	@echo ""
 	@echo "Targets:"
 	@echo "  all           - Build all components"
-	@echo "  daemon        - Build macOS UTUN daemon (no Xcode needed)"
+	@echo "  daemon        - Build macOS SMTP proxy daemon"
 	@echo "  test          - Run packet parser tests"
-	@echo "  ubuntu-deps   - Install Ubuntu dependencies"
-	@echo "  ubuntu-setup  - Setup Ubuntu server"
-	@echo "  ubuntu-run    - Run Ubuntu tunnel server"
+	@echo "  vps-setup     - Build tunnel server (ready for VPS deploy)"
 	@echo "  clean         - Clean build artifacts"
 	@echo ""
-	@echo "macOS daemon (no Apple entitlements needed):"
-	@echo "  make daemon"
-	@echo "  sudo macos/NetRewireDaemon/install-daemon.sh <ubuntu-ip>"
+	@echo "Daemon usage:"
+	@echo "  sudo macos/NetRewireDaemon/net-rewire-daemon <ubuntu-tailscale-ip>"
+	@echo ""
+	@echo "VPS deploy:"
+	@echo "  MAILCOW_TS_IP=<ip> bash ubuntu/setup.sh"
