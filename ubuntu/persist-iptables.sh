@@ -1,55 +1,29 @@
 #!/usr/bin/env bash
+# Net-Rewire iptables persistence
+# Saves current iptables rules and ensures they survive reboots.
+# Uses netfilter-persistent (iptables-persistent package).
 set -euo pipefail
 
-# Net-Rewire iptables persistence script
-# This script ensures iptables rules are restored on system reboot
+echo "=== Net-Rewire iptables persistence ==="
 
-echo "Setting up iptables persistence for Net-Rewire..."
-
-# Check if iptables-persistent is installed
+# Install if not present
 if ! command -v netfilter-persistent &> /dev/null; then
     echo "Installing iptables-persistent..."
-    sudo apt-get update
-    sudo apt-get install -y iptables-persistent
+    sudo apt-get update -qq
+    sudo apt-get install -y -qq iptables-persistent
 fi
 
-# Save current rules
+# Save current rules (both IPv4 and IPv6)
 echo "Saving current iptables rules..."
 sudo netfilter-persistent save
 
-# Create systemd service to ensure rules are applied at boot
-cat << EOF | sudo tee /etc/systemd/system/net-rewire-iptables.service
-[Unit]
-Description=Net-Rewire iptables rules
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=/sbin/iptables-restore /etc/iptables/rules.v4
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# Enable the service
-sudo systemctl daemon-reload
-sudo systemctl enable net-rewire-iptables.service
-
-# Create a script to manually restore rules if needed
-cat << 'EOF' | sudo tee /usr/local/bin/net-rewire-restore-rules
-#!/bin/bash
-# Net-Rewire iptables rules restore script
-
-/sbin/iptables-restore /etc/iptables/rules.v4
-echo "Net-Rewire iptables rules restored"
-EOF
-
-sudo chmod +x /usr/local/bin/net-rewire-restore-rules
-
-echo "Persistence setup completed!"
 echo ""
-echo "Commands:"
-echo "  sudo systemctl status net-rewire-iptables.service"
-echo "  sudo net-rewire-restore-rules"
-echo "  sudo netfilter-persistent save"
+echo "Rules saved. They will be restored on boot."
+echo ""
+echo "Current rules:"
+echo "--- PREROUTING ---"
+sudo iptables -t nat -L PREROUTING -n -v
+echo "--- FORWARD ---"
+sudo iptables -L FORWARD -n -v
+echo "--- POSTROUTING ---"
+sudo iptables -t nat -L POSTROUTING -n -v

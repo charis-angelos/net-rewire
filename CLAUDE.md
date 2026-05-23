@@ -1,19 +1,15 @@
-# Net-Rewire — SMTP-aware TCP proxy for outbound mail
+# Net-Rewire — SMTP-aware TCP proxy for outbound + inbound mail
 
-**Architecture:** macOS daemon (C) + Ubuntu tunnel server (C) + Mailcow Postfix relay.
-
-Mailcow Postfix → daemon (port 2525) → Tailscale → Ubuntu VPS → destination MX.
-
-No Network Extension, no packet capture, no UTUN — just an SMTP-aware TCP proxy that parses the envelope, resolves MX records, and tunnels through a lightweight relay server.
-
----
+**Architecture:** macOS daemon (C) + Ubuntu tunnel server (C) + iptables inbound forwarding + Mailcow.
 
 ## 1. Data flow
 
 ```
-Mailcow (Postfix)                 macOS daemon                  Ubuntu VPS                Internet
-  relayhost ──TCP:2525──>  parse RCPT TO, MX lookup  ──TCP:12345──>  connect_to_dest()  ──>  gmail-smtp-in.l.google.com:25
-                           replay SMTP handshake                  relay bytes bidirectionally
+                              OUTBOUND
+  Mailcow → daemon:2525 ──Tailscale──> VPS:tunnel_server:12345 ──> Internet MX
+
+                              INBOUND
+  Internet:25/587/465/143/993 ──> VPS:iptables DNAT ──Tailscale──> Mailcow
 ```
 
 ## 2. Components
@@ -21,57 +17,55 @@ Mailcow (Postfix)                 macOS daemon                  Ubuntu VPS      
 ### 2.1 macOS daemon (`macos/NetRewireDaemon/main.c`)
 
 - Listens on `0.0.0.0:2525`, accepts SMTP from Mailcow Postfix
-- **Interactive SMTP state machine**:
-  1. Send fake `220` banner
-  2. Read `EHLO` → send fake `250-xxx` multi-line response
-  3. Read `MAIL FROM` → send fake `250 2.1.0 Ok`
-  4. Read `RCPT TO` → extract recipient domain (e.g. `gmail.com`)
-  5. **MX lookup** via `res_query()` — lowest-preference MX record
-  6. Connect to Ubuntu VPS (Tailscale IP), send `CONNECT <mx>:25` frame
-  7. Discard real MX `220` banner
-  8. Replay `EHLO` to MX, **discard** response (Postfix already got fake 250)
-  9. Replay `MAIL FROM` to MX, **discard** response
-  10. Replay `RCPT TO` to MX, **forward** response to Postfix
-  11. **Relay mode** — bidirectional byte-for-byte relay between Postfix and MX
-- **Frame protocol**: 4-byte big-endian length prefix + payload
-- Logs to `/tmp/daemon.log` (unbuffered)
-- Requires root (`sudo`), linked with `-lresolv`
+- Interactive SMTP state machine: fake 220/250 for EHLO/MAIL FROM, real RCPT TO → MX lookup
+- MX resolution via `res_query()`, connects to VPS tunnel server
+- Frame protocol: 4-byte BE length + payload
+- Logs to `/tmp/daemon.log`, requires root, linked with `-lresolv`
 
 ### 2.2 Ubuntu tunnel server (`ubuntu/tunnel_server.c`)
 
-- Listens on port 12345, accepts daemon connections
-- Each connection: reads `CONNECT <host> <port>` frame, connects to destination via `getaddrinfo()` (AF_INET only — IPv4 forced for SPF alignment)
-- Relays bidirectionally: client → destination (raw TCP), destination → client (framed)
+- Listens on port 12345 (framed protocol), accepts daemon connections
+- `CONNECT <host> <port>` → `getaddrinfo()` with AF_INET → relay bidirectionally
 - Multi-threaded, detaches each client
 
-### 2.3 Mailcow integration
+### 2.3 Inbound forwarding (`ubuntu/inbound-forward.sh`)
+
+- iptables DNAT on VPS public interface: ports 25/143/465/587/993 → Mailcow Tailscale IP
+- Excludes Tailscale CGNAT range (100.64.0.0/10) — Tailscale clients talk directly
+- Forward + MASQUERADE for return path
+- Persisted via `netfilter-persistent`
+
+### 2.4 Mailcow integration
 
 - `docker-compose.yml`: `extra_hosts: host.docker.internal:host-gateway`
 - `main.cf`: `relayhost = [host.docker.internal]:2525`, `smtp_host_lookup = native`
-- DKIM: 1024-bit RSA key, selector `dkim`, single TXT record (fits 255-char limit)
-- SPF: `v=spf1 a mx ip4:160.251.141.121 ip6:2400:8500:2002:2951::/64 -all`
+- DKIM: 1024-bit RSA, selector `dkim`, single TXT record
+- SPF: `v=spf1 a mx ip4:<vps-ipv4> ip6:<vps-ipv6> -all`
 - DMARC: `v=DMARC1; p=quarantine; adkim=s; aspf=s`
 
-## 3. DNS (Google Cloud DNS, zone `dtype-info`)
-
-| Record | Value |
-|--------|-------|
-| SPF | `v=spf1 a mx ip4:160.251.141.121 ip6:2400:8500:2002:2951::/64 -all` |
-| DKIM | `v=DKIM1; k=rsa; p=MIGfMA0GCSq...` (1024-bit, single TXT, ≤255 chars) |
-| DMARC | `v=DMARC1; p=quarantine; adkim=s; aspf=s` |
-
-## 4. Build & deploy
+## 3. Build & deploy
 
 ```bash
 # macOS daemon
 make daemon
-sudo macos/NetRewireDaemon/net-rewire-daemon <ubuntu-tailscale-ip>
+sudo macos/NetRewireDaemon/net-rewire-daemon <vps-tailscale-ip>
 
-# Ubuntu tunnel server
-make ubuntu/tunnel_server
-scp ubuntu/tunnel_server root@<vps>:~/
-ssh root@<vps> "gcc -Wall -O2 -o tunnel_server tunnel_server.c -lpthread && sudo systemctl restart tunnel-server"
+# VPS (one-shot deploy)
+make vps-setup
+scp ubuntu/* root@<vps>:~/net-rewire/
+ssh root@<vps> 'cd net-rewire && MAILCOW_TS_IP=<mailcow-tailscale-ip> bash setup.sh'
 ```
+
+## 4. VPS setup details
+
+`ubuntu/setup.sh` does:
+1. Install build-essential + iptables-persistent
+2. Compile and install tunnel_server → `/usr/local/bin/`
+3. Install systemd service `net-rewire-tunnel-server`
+4. Apply inbound iptables DNAT rules
+5. Enable IP forwarding + persist rules
+
+`ubuntu/inbound-forward.sh` supports: `apply | remove | show`
 
 ## 5. Debugging
 
@@ -79,29 +73,32 @@ ssh root@<vps> "gcc -Wall -O2 -o tunnel_server tunnel_server.c -lpthread && sudo
 # Daemon log
 tail -f /tmp/daemon.log
 
-# Test SMTP through daemon
+# VPS iptables
+ssh root@<vps> 'MAILCOW_TS_IP=<ip> bash inbound-forward.sh show'
+
+# VPS tunnel server
+ssh root@<vps> 'systemctl status net-rewire-tunnel-server'
+ssh root@<vps> 'journalctl -u net-rewire-tunnel-server -f'
+
+# Test outbound SMTP from macOS
 python3 -c "
-import smtplib; from email.mime.text import MIMEText
-msg = MIMEText('test')
-msg['From'] = 'saintway@dtype.info'
-msg['To'] = 'saintway2025@gmail.com'
-s = smtplib.SMTP('100.124.238.64', 2525, timeout=60)
+import smtplib
+s = smtplib.SMTP('127.0.0.1', 2525, timeout=60)
 s.set_debuglevel(1)
-s.sendmail(msg['From'], [msg['To']], msg.as_string())
+s.sendmail('user@dtype.info', ['target@gmail.com'], 'test')
 s.quit()
 "
 
-# Check DNS
-dig txt dtype.info @8.8.8.8 +short
-dig txt dkim._domainkey.dtype.info @8.8.8.8 +short
-
-# Mailcow rspamd DKIM signing check
-docker logs mailcowdockerized-rspamd-mailcow-1 | grep DKIM_SIGNED
+# Test inbound from external host
+telnet <vps-public-ip> 25
+# Should see: 220 mail.dtype.info ESMTP Postcow
 ```
 
 ## 6. Key design decisions
 
-- **SMTP proxy, not packet tunnel**: Postfix connects directly to daemon via TCP. No PF rdr, no UTUN, no Network Extension.
-- **Fake SMTP responses for EHLO/MAIL FROM**: Postfix gets immediate 250 responses, real MX responses discarded. Only RCPT TO response is forwarded.
-- **AF_INET on tunnel server**: Forces IPv4 to align with SPF `ip4:` authorization.
-- **1024-bit DKIM**: Fits in single TXT record (234 chars). 2048-bit would need 2 records causing random-ordering verification failures.
+- **SMTP proxy, not packet tunnel**: Postfix connects directly via TCP. No Network Extension.
+- **Fake SMTP for EHLO/MAIL FROM**: Postfix gets immediate 250; real MX responses discarded.
+- **AF_INET on tunnel server**: IPv4-only for SPF alignment.
+- **1024-bit DKIM**: Single TXT record, no split-ordering bug.
+- **iptables for inbound**: Preserves original sender IP (DNAT, not proxy), kernel-level performance.
+- **Tailscale CGNAT exclusion**: `! 100.64.0.0/10` — Tailscale clients reach Mailcow directly.

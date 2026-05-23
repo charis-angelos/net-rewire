@@ -1,0 +1,23 @@
+[Unit]
+Description=Net-Rewire Tunnel Server (outbound SMTP relay)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/net-rewire-tunnel-server
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=net-rewire-tunnel
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/log
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
