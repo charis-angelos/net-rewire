@@ -2,7 +2,7 @@
 # Build system for C components
 
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -std=c99
+CFLAGS = -Wall -Wextra -O2 -std=c99 -D_GNU_SOURCE
 LDFLAGS =
 
 # Targets
