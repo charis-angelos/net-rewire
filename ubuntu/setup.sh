@@ -28,7 +28,7 @@ sudo apt-get install -y -qq build-essential iptables-persistent
 echo ""
 echo "--- Building tunnel server ---"
 cd "$SCRIPT_DIR"
-gcc -Wall -Wextra -O2 -std=c99 -o net-rewire-tunnel-server tunnel_server.c -lpthread
+gcc -Wall -Wextra -O2 -std=c99 -D_GNU_SOURCE -o net-rewire-tunnel-server tunnel_server.c -lpthread
 sudo cp net-rewire-tunnel-server /usr/local/bin/net-rewire-tunnel-server
 sudo chmod +x /usr/local/bin/net-rewire-tunnel-server
 
@@ -45,7 +45,7 @@ sudo systemctl restart net-rewire-tunnel-server
 # --- 4. Apply iptables inbound rules ---
 echo ""
 echo "--- Applying inbound iptables rules ---"
-sudo bash "$SCRIPT_DIR/inbound-forward.sh" apply
+sudo MAILCOW_TS_IP="$MAILCOW_TS_IP" bash "$SCRIPT_DIR/inbound-forward.sh" apply
 
 # --- 5. Enable IP forwarding ---
 echo ""
@@ -68,6 +68,6 @@ echo "Services:"
 sudo systemctl status net-rewire-tunnel-server --no-pager -l || true
 echo ""
 echo "iptables rules:"
-sudo bash "$SCRIPT_DIR/inbound-forward.sh" show
+sudo MAILCOW_TS_IP="$MAILCOW_TS_IP" bash "$SCRIPT_DIR/inbound-forward.sh" show
 echo ""
 echo "Verify from outside: telnet <vps-public-ip> 25"
