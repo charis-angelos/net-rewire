@@ -71,43 +71,90 @@ static int connect_to_ubuntu(void) {
 
 /* ── Frame protocol helpers (4-byte BE length + data) ─────────── */
 
-static ssize_t read_frame(int fd, uint8_t *buf, size_t max_len) {
-    uint32_t net_len = 0;
-    ssize_t n = recv(fd, &net_len, 4, 0);
-    if (n <= 0) return n;
-    if (n < 4) {
-        /* Partial read — drain remaining */
-        size_t got = (size_t)n;
-        while (got < 4) {
-            n = recv(fd, ((uint8_t *)&net_len) + got, 4 - got, 0);
-            if (n <= 0) return n;
-            got += (size_t)n;
+/* recv() that survives EAGAIN/EWOULDBLOCK on a non-blocking fd by waiting
+   (up to timeout_s) for readability, instead of treating it as EOF/error.
+   Works transparently on blocking fds too. */
+static ssize_t recv_wait(int fd, void *buf, size_t len, int timeout_s) {
+    for (;;) {
+        ssize_t n = recv(fd, buf, len, 0);
+        if (n >= 0) return n;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(fd, &rfds);
+            struct timeval tv = {timeout_s, 0};
+            int rc = select(fd + 1, &rfds, NULL, NULL, &tv);
+            if (rc <= 0) return -1; /* timeout or error */
+            continue;
         }
+        if (errno == EINTR) continue;
+        return -1;
+    }
+}
+
+/* send() counterpart: waits for writability on EAGAIN instead of failing. */
+static ssize_t send_wait(int fd, const void *buf, size_t len, int timeout_s) {
+    for (;;) {
+        ssize_t n = send(fd, buf, len, 0);
+        if (n >= 0) return n;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(fd, &wfds);
+            struct timeval tv = {timeout_s, 0};
+            int rc = select(fd + 1, NULL, &wfds, NULL, &tv);
+            if (rc <= 0) return -1; /* timeout or error */
+            continue;
+        }
+        if (errno == EINTR) continue;
+        return -1;
+    }
+}
+
+static ssize_t read_frame(int fd, uint8_t *buf, size_t max_len) {
+    uint8_t header[4];
+    size_t got = 0;
+    while (got < 4) {
+        ssize_t n = recv_wait(fd, header + got, 4 - got, 30);
+        if (n <= 0) return n;
+        got += (size_t)n;
     }
 
+    uint32_t net_len;
+    memcpy(&net_len, header, 4);
     uint32_t len = ntohl(net_len);
     if (len == 0 || len > max_len) return -1;
 
     size_t total = 0;
     while (total < len) {
-        n = recv(fd, buf + total, len - total, 0);
+        ssize_t n = recv_wait(fd, buf + total, len - total, 30);
         if (n <= 0) return n;
         total += (size_t)n;
     }
     return (ssize_t)total;
 }
 
+/* Writes the full 4-byte length header + payload, looping through any
+   partial writes (expected on a non-blocking socket) instead of treating
+   them as failures. */
 static ssize_t write_frame(int fd, const uint8_t *data, size_t len) {
     uint32_t net_len = htonl((uint32_t)len);
-    struct iovec iov[2];
-    iov[0].iov_base = &net_len;
-    iov[0].iov_len  = 4;
-    iov[1].iov_base = (void *)data;
-    iov[1].iov_len  = len;
+    uint8_t header[4];
+    memcpy(header, &net_len, 4);
 
-    ssize_t sent = writev(fd, iov, 2);
-    if (sent < 0) return -1;
-    if (sent != (ssize_t)(4 + len)) return -1;
+    size_t hsent = 0;
+    while (hsent < 4) {
+        ssize_t n = send_wait(fd, header + hsent, 4 - hsent, 30);
+        if (n <= 0) return -1;
+        hsent += (size_t)n;
+    }
+
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send_wait(fd, data + sent, len - sent, 30);
+        if (n <= 0) return -1;
+        sent += (size_t)n;
+    }
     return (ssize_t)len;
 }
 
@@ -259,11 +306,9 @@ static void relay_pair(int local_fd, int ubuntu_fd) {
         /* Local (Postfix) → Ubuntu */
         if (FD_ISSET(local_fd, &rfds)) {
             uint8_t buf[65535];
-            ssize_t n = recv(local_fd, buf, sizeof(buf), 0);
+            ssize_t n = recv_wait(local_fd, buf, sizeof(buf), 30);
             if (n <= 0) break;
-            if (write_frame(ubuntu_fd, buf, (size_t)n) < 0) {
-                if (errno != EAGAIN && errno != EWOULDBLOCK) break;
-            }
+            if (write_frame(ubuntu_fd, buf, (size_t)n) < 0) break;
         }
 
         /* Ubuntu → Local (Postfix) */
@@ -271,12 +316,16 @@ static void relay_pair(int local_fd, int ubuntu_fd) {
             uint8_t buf[65535];
             ssize_t n = read_frame(ubuntu_fd, buf, sizeof(buf));
             if (n <= 0) break;
-            ssize_t sent = send(local_fd, buf, (size_t)n, 0);
-            if (sent < 0) {
-                if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+            size_t sent = 0;
+            while (sent < (size_t)n) {
+                ssize_t w = send_wait(local_fd, buf + sent, (size_t)n - sent, 30);
+                if (w <= 0) goto relay_done;
+                sent += (size_t)w;
             }
         }
     }
+relay_done:
+    return;
 }
 
 /* ── Per-connection handler ───────────────────────────────────── */
